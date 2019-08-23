@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import rasterio as rio
 import geopandas as gpd
+from rasterio import features
 from rasterio.mask import mask
 from shapely.geometry import mapping
 
@@ -37,9 +38,10 @@ class params():
     FeatureDirectory = None
     identifier = None
     ImageDirectory = None
+    wildcard = None
     
     def __init__(self, platform = None, FeatureDirectory = None, 
-                 identifier = None, ImageDirectory = None, parser = None):  
+                 identifier = None, ImageDirectory = None, wildcard = None, parser = None):  
         if parser:
             
             self.readParser(parser)
@@ -48,13 +50,161 @@ class params():
             self.FeatureDirectory = FeatureDirectory
             self.identifier = identifier
             self.ImageDirectory = ImageDirectory
+            self.wildcard = wildcard
         
     def readParser(self, parser):
         self.platform = parser.platform[0]
         self.FeatureDirectory = parser.Features[0]
         self.identifier = parser.index[0]
         self.ImageDirectory = parser.ImageDirectory[0]
+        self.wildcard = parser.wildcard[0]
 
+class CloudMask:
+    
+    maskFolder = None
+    tempFolder = None
+    
+    def __init__(self, product, inFolder):
+        self.tempFolder = tempfile.mkdtemp(dir = inFolder, prefix = 'CloudCover')
+        self.tempRaster = os.path.join(self.tempFolder, 'tempMask.tif')
+        self.setCloudMaskFolder(product, inFolder)
+        print(self.maskFolder)
+        if product == 'Sentinel2Copernicus':
+            self.createESASentinel2_cloudmask()
+        if product == 'Sentinel2Theia': 
+             self.createTheiaSentinel2_cloudmask()
+        if product == 'Venus':
+            self.createVenus_cloudmask()
+        return 
+    
+    def setCloudMaskFolder(self, product, inFolder):
+        if product == 'Sentinel2Copernicus':
+            self.maskFolder = glob.glob(os.path.join(inFolder, "GRANULE", os.listdir(os.path.join(inFolder, "GRANULE"))[0], "QI_DATA"))[0]
+        
+        if product == 'Sentinel2Theia':
+            self.maskFolder = glob.glob(os.path.join(inFolder, 'MASKS'))[0]
+        
+        if product == 'Venus':
+            self.maskFolder = glob.glob(os.path.join(inFolder, '*.DBL.DIR'))[0]
+            
+    def createMaskfromBits(self, qaFile, endBit, startBit, band = 1):
+        '''
+        Reads bit-encoded rasters and decodes them into masks representing 
+        specified bit(s). This can be used to extract cloud or other masks from 
+        the quality layers provided with Landsat and Venus products.
+        
+        The values in the main script are set to the standard encoding of the 
+        products. Please consult with product manuals to identify the specific 
+        values encoded.
+        '''
+        qaBand = qaFile.read(band)
+        width_int = int((endBit - startBit + 1) * "1", 2) 
+        return ((qaBand >> startBit) & width_int).astype('uint8')
+            
+    def readSentinel2QualityGML(self, s2mask = 'MSK_CLOUDS_B00'):
+        '''
+        Sentinel-2 Quality Masks are provided as .gml files. This function reads 
+        user defined masks and reads them as geopandas geodataframes
+        '''
+        maskFile = os.path.join(self.maskFolder, "{}.gml".format(s2mask))
+        
+        # geopandas.read_file cannot extract the crs from .gml files. Instead the
+        # crs is taken from the pre-view image jpeg200 
+        crsFile = glob.glob(os.path.join(self.maskFolder, '*.jp2'))[0]
+        
+        # Use rasterio to extract crs from pre-view image
+        with rio.open(crsFile) as crs_layer:
+            crs = crs_layer.crs.to_epsg()
+            tempArray = np.zeros((crs_layer.height, crs_layer.width), dtype='int16')
+            transform = crs_layer.transform
+            
+        # read mask to geopandas dataframe and assign crs from pre-view image
+        maskData = gpd.read_file(maskFile, driver = 'gml')
+        maskData.crs = crs
+        
+        if len(glob.glob(os.path.join(self.maskFolder, '*.gfs'))) > 0:
+            for gfsFile in glob.glob(os.path.join(self.maskFolder, '*.gfs')):
+                os.remove(gfsFile)
+        
+        # return the mask as a unary union geodataframe. The reference system is
+        # also returned for later use
+                        
+        return(maskData, maskData.crs, tempArray, transform)
+    
+    def createESASentinel2_cloudmask(self):
+        try:
+            cloudMask, crs, tempArray, transform = self.readSentinel2QualityGML(s2mask = 'MSK_CLOUDS_B00')
+            sensorFootprint = self.readSentinel2QualityGML(s2mask = 'MSK_DETFOO_B01')[0]
+            cloudShapes = ((geom, 1) for geom in cloudMask.geometry)
+            cloudArray = features.rasterize(shapes = cloudShapes, fill = 0, out=tempArray, transform = transform)
+            noClouds = False 
+        except ValueError: 
+            noClouds = True                              
+            sensorFootprint, crs, tempArray, transform  = self.readSentinel2QualityGML(s2mask = 'MSK_DETFOO_B01')
+        
+        sensorShape = ((geom, 1) for geom in sensorFootprint.geometry)
+        inArray = features.rasterize(shapes = sensorShape, fill = 0, out=tempArray, transform = transform)
+        inArray.dtype = 'int16'
+        
+        if not noClouds:
+            inArray = np.where(inArray == 1, cloudArray, 1)
+       
+        with rio.open(self.tempRaster, 'w', driver = 'GTiff',
+                            height = inArray.shape[0], width = inArray.shape[1],
+                            count = 1, dtype='int16',
+                            crs = crs,
+                            transform = transform) as rasterFile:       
+            rasterFile.write_band(1, inArray)
+        return()
+           
+        
+    def createTheiaSentinel2_cloudmask(self):
+        cloudMask = glob.glob(os.path.join(self.maskFolder, '*CLM_R1.tif'))[0]
+        sensorMask = glob.glob(os.path.join(self.maskFolder, '*EDG_R1.tif'))[0]
+        
+        with rio.open(cloudMask) as cloudRaster:    
+            cloudArray = self.createMaskfromBits(cloudRaster, 0, 0)
+            crs = cloudRaster.crs.to_dict()
+            transform = cloudRaster.transform
+        with rio.open(sensorMask) as sensorRaster:
+            sensorArray = self.createMaskfromBits(sensorRaster, 0, 0)
+            
+        inArray = np.where(sensorArray == 0, cloudArray, 1)
+
+        with rio.open(self.tempRaster, 'w', driver = 'GTiff',
+                                height = inArray.shape[0], width = inArray.shape[1],
+                                count = 1, dtype='uint8',
+                                crs = crs,
+                                transform = transform) as rasterFile:       
+                rasterFile.write_band(1, inArray)   
+        
+        
+    def createVenus_cloudmask(self):
+        cloudMask = glob.glob(os.path.join(self.maskFolder, '*CLD.DBL.tif'))[0]
+        sensorMask = glob.glob(os.path.join(self.maskFolder, '*QLT.DBL.tif'))[0]
+        
+        with rio.open(cloudMask) as cloudRaster:    
+            cloudArray = self.createMaskfromBits(cloudRaster, 0, 0)
+            crs = cloudRaster.crs.to_dict()
+            transform = cloudRaster.transform
+            
+        with rio.open(sensorMask) as sensorRaster:
+            sensorArray = self.createMaskfromBits(sensorRaster, 0, 0, band = 3)
+            
+        inArray = np.where(sensorArray == 0, cloudArray, 1)
+
+        with rio.open(self.tempRaster, 'w', driver = 'GTiff',
+                                height = inArray.shape[0], width = inArray.shape[1],
+                                count = 1, dtype='uint8',
+                                crs = crs,
+                                transform = transform) as rasterFile:       
+                rasterFile.write_band(1, inArray)
+                
+    def deleteTempFolder(self):
+        shutil.rmtree(self.tempFolder, ignore_errors = True)
+        
+        
+    
 def any_in(a, b): 
     '''
     A handy little function that will check two lists for coninciding items
@@ -92,10 +242,10 @@ def extract_by_feature(inRaster, extractGDF, featureID, *args):
                 # and the raster transformation. The nodata value is used as a
                 # filler for final array. 
                 out_image, out_transform = mask(rioRaster, geojson, crop=True, 
-                                                nodata = 25)
+                                                nodata = 255)
                 
                 # exclude the extract if all cells have a no data value
-                if np.unique(out_image) != 25:
+                if np.unique(out_image) != 255:
                     if args:
                         # If additional arguments are given, exclude tiles that 
                         # include the given values
@@ -152,55 +302,6 @@ def extract_zip(inZipFile, outFolder, file = None):
         zip_ref.extract(member = file, path = outFolder)
     zip_ref.close()
     
-def createMaskfromBits(qaFile, b1, b2):
-    '''
-    Reads bit-encoded rasters and decodes them into masks representing 
-    specified bit(s). This can be used to extract cloud or other masks from 
-    the quality layers provided with Landsat and Venus products.
-    
-    The values in the main script are set to the standard encoding of the 
-    products. Please consult with product manuals to identify the specific 
-    values encoded.
-    '''
-    qaBand = qaFile.read()
-    width_int = int((b1 - b2 + 1) * "1", 2) 
-    return ((qaBand >> b2) & width_int).astype('uint8')
-
-def writeArrayToRaster(inArray, outRaster, crs, transform, driver = "GTiff"):
-    '''
-    A function to write a numpy array to a GeoTIFF raster. Requires a 
-    coordinate reference system and a transfomation provided.
-    '''
-    with rio.open(outRaster, 'w', driver = driver,
-                            height = inArray.shape[1], width = inArray.shape[2],
-                            count = 1, dtype=str(inArray.dtype),
-                            crs = crs,
-                            transform = transform) as rasterFile:
-        rasterFile.write(inArray)
-    
-    return rasterFile
-
-def readSentinel2QualityMasks(s2Folder, s2mask = 'MSK_CLOUDS_B00'):
-    '''
-    Sentinel-2 Quality Masks are provided as .gml files. This function reads 
-    user defined masks and reads them as geopandas geodataframes
-    '''
-    maskFile = glob.glob(os.path.join(s2Folder, "GRANULE", os.listdir(os.path.join(s2Folder, "GRANULE"))[0], "QI_DATA", "*{}*.*".format(s2mask)))[0]
-    
-    # geopandas.read_file cannot extract the crs from .gml files. Instead the
-    # crs is taken from the pre-view image jpeg200 
-    crsFile = glob.glob(os.path.join(s2Folder, "GRANULE", os.listdir(os.path.join(s2Folder, "GRANULE"))[0], "QI_DATA", '*.jp2'))[0]
-    
-    # Use rasterio to extract crs from pre-view image
-    with rio.open(crsFile) as crs_layer:
-        crs = crs_layer.crs.to_epsg()  
-    # read mask to geopandas dataframe and assign crs from pre-view image
-    maskData = gpd.read_file(maskFile, driver = 'gml')
-    maskData.crs = crs
-    
-    # return the mask as a unary union geodataframe. The reference system is
-    # also returned for later use
-    return(maskData.unary_union, maskData.crs)
 
 def read_FC_to_GDF(fullFCPath):
     '''
@@ -243,73 +344,17 @@ def readFeaturesToGDF(inFeatures):
         raise(Exception("Input feature class does not have a spatial reference system defined."))
     return(featuresGDF)
         
-def checkS2CloudCover(dataFolder, inFeatures, identifier):
-    '''
-    Checks if a set of features is obscured by cloud cover on a Sentinel-2 
-    image. Cloud cover is obtained either from the Sentinel-2 QI files or by 
-    using the fmask algorithm. 
-    '''
-    
-    try:
-        featureOverlay = dict()
-        cloudMask, crs = readSentinel2QualityMasks(dataFolder, s2mask = 'MSK_CLOUDS_B00')
-    except ValueError:                               
-        sensorFootprint, crs = readSentinel2QualityMasks(dataFolder, s2mask = 'MSK_DETFOO_B01')
-        
-        inFeatures = inFeatures.to_crs(epsg = crs)  
-        for idx, point in inFeatures.iterrows():
-            if point.geometry.within(sensorFootprint):
-                featureOverlay[point[identifier]] = os.path.basename(dataFolder)
-        return(featureOverlay) 
-    
-    sensorFootprint, crs = readSentinel2QualityMasks(dataFolder, s2mask = 'MSK_DETFOO_B01')
-    
-    inFeatures = inFeatures.to_crs(epsg = crs) 
-    for idx, point in inFeatures.iterrows():
-        if point.geometry.within(sensorFootprint) and not point.geometry.within(cloudMask):
-           featureOverlay[point[identifier]] = os.path.basename(dataFolder)
-
-    if len(featureOverlay) > 0:
-        return(featureOverlay)    
-    else: return(None)
-    
-def checkVenusCloudCover(dataFolder, inFeatures):
-    '''
-    Checks if a set of features is obscured by cloud cover on a Venus image. 
-    Cloud cover is obtained from the Venus QI layer 
-    ''' 
-    cloudLayer = os.path.join(dataFolder, [folder for folder in os.listdir(dataFolder) if folder.endswith('CLD.DBL.TIF')][0])
-    with rio.open(cloudLayer) as tempLayer:    
-        cloudMaskArray = createMaskfromBits(tempLayer, 0, 0)
-        crs = tempLayer.crs.to_dict() 
-        
-        transform = tempLayer.transform
-    cloudMask = os.path.join(tempDirectory, "tempCCMask.tif")
-    writeArrayToRaster(cloudMaskArray, cloudMask, crs, transform)        
-    featureOverlay = extract_by_feature(cloudMask, inFeatures, identifier, -999, 1) 
-    return(featureOverlay)
-    
-def LandsatCloudCover(dataFolder, inFeatures):
-    cloudLayer = glob.glob(dataFolder + '\\*qa*.*')[0]
-    band = 5 if 'pixel_qa' in cloudLayer else 4
-    with rio.open(cloudLayer) as tempLayer:    
-        cloudMaskArray = createMaskfromBits(tempLayer, band, band)
-        crs = tempLayer.crs.to_dict() 
-        transform = tempLayer.transform
-    cloudMask = os.path.join(tempDirectory, "tempCCMask.tif")
-    writeArrayToRaster(cloudMaskArray, cloudMask, crs, transform)  
-    featureOverlay = extract_by_feature(cloudMask, inFeatures, identifier, 1) 
-    return(featureOverlay)
     
 def main():
     finalFeatureList = dict(site = list(), image = list())
     inFeatures = readFeaturesToGDF(FeatureDirectory)
     
-    imageIdentifier = {'Sentinel2': 'S2',
+    imageIdentifier = {'Sentinel2Copernicus': 'S2',
+                       'Sentinel2Theia': 'SENTINEL2', 
                        'Venus': 'VENUS',
                        'Landsat8': 'LC8'}
     
-    imageArchive = [os.path.join(ImageDirectory, folder) for folder in os.listdir(ImageDirectory) if imageIdentifier[platform] in folder]
+    imageArchive = glob.glob(os.path.join(ImageDirectory, "{}*{}*".format(imageIdentifier[platform], wildcard)))
 
     for image in imageArchive:
         print("Checking {}...".format(os.path.basename(image)))
@@ -326,30 +371,24 @@ def main():
             extract_zip(image, tempDirectory)
             DECOMPRESSED = True
             
-        if platform == 'Venus':
-            if DECOMPRESSED: 
-                dataFolder = os.path.join(tempDirectory, [folder for folder in os.listdir(tempDirectory) if folder.endswith('.DIR')][0])
-            else: dataFolder = image
-            featureOverlay = checkVenusCloudCover(dataFolder, inFeatures)
+        if DECOMPRESSED:
+            if platform == "Sentinel2Copernicus":
+                inFolder = os.path.join(tempDirectory, os.path.basename(image.replace('.zip', '.SAFE')))
+            else:
+                inFolder = os.path.join(tempDirectory, os.path.basename(image.replace('.zip', '')))
+        else:
+            inFolder = image
             
-        elif platform == "Landsat8":
-            if DECOMPRESSED: 
-                dataFolder = tempDirectory
-            featureOverlay = checkS2CloudCover(dataFolder, inFeatures, identifier = identifier)
-        
-        elif platform == "Sentinel2":
-            if DECOMPRESSED: 
-                dataFolder = os.path.join(tempDirectory, [folder for folder in os.listdir(tempDirectory) if folder.endswith('.SAFE')][0])
-                
-            else: dataFolder = image
-            featureOverlay = checkS2CloudCover(dataFolder, inFeatures, identifier = identifier)
-                   
+        cloudRaster = CloudMask(platform, inFolder)
+        featureOverlay = extract_by_feature(cloudRaster.tempRaster, inFeatures, identifier, 1, 255) 
+        cloudRaster.deleteTempFolder()
+         
         if featureOverlay:
             for key, value in featureOverlay.items():
                 finalFeatureList['site'].append(key)  
                 finalFeatureList['image'].append(os.path.basename(image))  
          
-        shutil.rmtree(tempDirectory)
+        shutil.rmtree(tempDirectory, ignore_errors = True)
                 
     finalFeatureFrame = pd.DataFrame(data = finalFeatureList)  
     finalFeatureFrame.to_csv(os.path.join(ImageDirectory, "CloudFreeFeatures_{}.csv".format(platform)))#
@@ -367,12 +406,14 @@ if __name__ == "__main__":
                     help='Shapefile or directory containing a set of shapefiles')
     parser.add_argument('ImageDirectory', type = str, nargs = 1,
                     help='Directory containing satellite images that should be tested for cloud cover')
-    parser.add_argument('platform', type = str, nargs = 1, choices = ['Sentinel2', 'Venus', 'Landsat'],
+    parser.add_argument('platform', type = str, nargs = 1, choices = ['Sentinel2Copernicus', 'Sentinel2Theia','Venus', 'Landsat'],
                         help = 'Select satellite platform (important for selecting the right cloud cover)')
     parser.add_argument('-i', '--index', type = str, nargs = 1, metavar = '', default = 'index',
                         help = 'In case of multiple features is is advised to provide a unique feature identifier field to identify the feature that was recognised  as cloud free. Will default to a generic "index"')
     parser.add_argument('-f', '--fmask', type = bool, nargs = 1, default = False, metavar = '',
                         help = 'Calcluate Sentinel-2 cloud mask using the fmask algorithm. Default: False ')
+    parser.add_argument('-w', '--wildcard', type = str, nargs = 1, default = "", metavar = '',
+                        help = 'Wildcard to subset archive before search (to specify dates, tiles, etc). Default: None ')
 
 # =============================================================================
 #     Parsing input arguments
@@ -386,7 +427,8 @@ if __name__ == "__main__":
     FeatureDirectory = config.FeatureDirectory
     identifier = config.identifier
     ImageDirectory = config.ImageDirectory
-    tempDirectory = tempfile.mkdtemp(dir = ImageDirectory, prefix = 'CloudCover')
+    wildcard = config.wildcard
+    tempDirectory = tempfile.mkdtemp(dir = ImageDirectory, prefix = 'decompressed_')    
     print(FeatureDirectory)
 
 # =============================================================================
