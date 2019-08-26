@@ -1,6 +1,6 @@
 # CloudCoverTool
 
-The tool will scan an archive of satellite imagery (Sentinel-2 Level-1C; Landsat 8 Level-1C, SR; Venµs SR) 
+The tool will scan an archive of satellite imagery (Sentinel-2 (Level-1C, Level-2 ESA and MUSCATE; Landsat 8 Level-1C, SR; Venµs SR) 
 and return all images that according to the product specific cloud mask are cloud free at a user defined
 area of interest.
 
@@ -22,3 +22,4 @@ Location of the imagery archive<br/>
 Satellite Platform (Sentinel-2, Landsat-8, Venus)<br/>
 <b> Optional </b><br/>
 -i Feature identifier<br/>
+-w Wildcard for subsetting image archive by file/foldernames
