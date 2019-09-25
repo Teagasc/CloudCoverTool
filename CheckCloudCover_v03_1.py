@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Spyder Editor
 
 The aim of this script is to assess the amount of useful (cloud free) satellite
 imagery on a parcel/field base
 
 It can either take centorids or full polygons as an input for the parcels and
 will read Sentinel-2 A and B images. 
+
+The tool was written by:
+Jesko Zimmermann
+Department of Agri-Food Business and Spatial Analysis
+Teagasc Ashtown Research Centre
 
 """
 
